@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import flyte
 import pytest
@@ -344,3 +345,94 @@ def test_no_autoscaler_options_when_absent(sctx):
     ray_job = _to_ray_job(ray_task.custom_config(sctx))
 
     assert not ray_job.ray_cluster.HasField("autoscaler_options")
+
+
+def test_existing_cluster_config(sctx):
+    ray_task = _build_ray_task(RayJobConfig(existing_cluster="shared-gpu"))
+
+    assert ray_task.config(sctx) == {"ray.existing_cluster": "shared-gpu"}
+
+
+def test_existing_cluster_custom_config_omits_ray_cluster(sctx):
+    ray_task = _build_ray_task(RayJobConfig(existing_cluster="shared-gpu", runtime_env={"pip": ["numpy"]}))
+
+    custom = ray_task.custom_config(sctx)
+
+    assert "rayCluster" not in custom
+    assert custom["runtimeEnvYaml"] == "pip:\n- numpy\n"
+
+
+def test_no_existing_cluster_emits_no_config(sctx):
+    ray_task = _build_ray_task(RayJobConfig(worker_node_config=[]))
+
+    assert ray_task.config(sctx) == {}
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"worker_node_config": [WorkerNodeConfig(group_name="grp", replicas=1)]}, "worker_node_config"),
+        ({"head_node_config": HeadNodeConfig()}, "head_node_config"),
+        ({"shutdown_after_job_finishes": True}, "shutdown_after_job_finishes"),
+        ({"ttl_seconds_after_finished": 60}, "ttl_seconds_after_finished"),
+        ({"enable_autoscaling": True}, "enable_autoscaling"),
+        ({"autoscaler_options": AutoscalerOptionsConfig()}, "autoscaler_options"),
+        ({"address": "ray://head:10001"}, "address"),
+    ],
+)
+def test_existing_cluster_rejects_cluster_settings(kwargs, match):
+    import flyte.errors
+
+    with pytest.raises(flyte.errors.RuntimeUserError, match=match):
+        _build_ray_task(RayJobConfig(existing_cluster="shared-gpu", **kwargs))
+
+
+def test_existing_cluster_rejects_reuse_policy():
+    import flyte.errors
+
+    with pytest.raises(flyte.errors.RuntimeUserError, match="reuse policy"):
+        RayFunctionTask(
+            name="t",
+            interface=None,
+            func=lambda: None,
+            plugin_config=RayJobConfig(existing_cluster="shared-gpu"),
+            reusable=flyte.ReusePolicy(replicas=1, idle_ttl=600),
+        )
+
+
+@pytest.mark.asyncio
+async def test_existing_cluster_pre_inits_without_address(monkeypatch):
+    import ray
+
+    calls = []
+    monkeypatch.setattr(ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ray, "init", lambda **kwargs: calls.append(kwargs))
+    ray_task = _build_ray_task(RayJobConfig(existing_cluster="shared-gpu"))
+
+    await ray_task.pre()
+
+    assert calls == [{}]
+
+
+@pytest.mark.asyncio
+async def test_existing_cluster_pre_skips_working_dir_in_cluster(monkeypatch):
+    import ray
+
+    calls = []
+    monkeypatch.setattr(ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ray, "init", lambda **kwargs: calls.append(kwargs))
+    in_cluster_ctx = SimpleNamespace(is_in_cluster=lambda: True)
+    monkeypatch.setattr(flyte, "ctx", lambda: in_cluster_ctx)
+    ray_task = _build_ray_task(RayJobConfig(existing_cluster="shared-gpu"))
+
+    await ray_task.pre()
+
+    assert calls == [{}]
+
+
+def test_existing_cluster_keeps_positional_fields():
+    head = HeadNodeConfig()
+    cfg = RayJobConfig([], head)
+
+    assert cfg.head_node_config is head
+    assert cfg.existing_cluster is None

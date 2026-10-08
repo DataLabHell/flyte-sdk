@@ -3,7 +3,7 @@ import copy
 import json
 import os
 import typing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import flyte
@@ -30,6 +30,7 @@ if typing.TYPE_CHECKING:
 
 _RAY_HEAD_CONTAINER_NAME = "ray-head"
 _RAY_WORKER_CONTAINER_NAME = "ray-worker"
+_EXISTING_CLUSTER_KEY = "ray.existing_cluster"
 
 
 @dataclass
@@ -143,7 +144,14 @@ class WorkerNodeConfig:
 
 @dataclass
 class RayJobConfig:
-    worker_node_config: typing.List[WorkerNodeConfig]
+    """Configuration for a Ray task.
+
+    existing_cluster: name of an existing KubeRay RayCluster in the execution namespace. The task
+                      runs as a Ray job on that cluster instead of creating one.
+    address: Ray Client address for `ray.init`. Deprecated; use existing_cluster.
+    """
+
+    worker_node_config: typing.List[WorkerNodeConfig] = field(default_factory=list)
     head_node_config: typing.Optional[HeadNodeConfig] = None
     enable_autoscaling: bool = False
     autoscaler_options: typing.Optional[AutoscalerOptionsConfig] = None
@@ -151,6 +159,7 @@ class RayJobConfig:
     address: typing.Optional[str] = None
     shutdown_after_job_finishes: bool = False
     ttl_seconds_after_finished: typing.Optional[int] = None
+    existing_cluster: Optional[str] = None
 
 
 def _build_autoscaler_options(opts: Optional[AutoscalerOptionsConfig]) -> Optional[AutoscalerOptions]:
@@ -179,6 +188,8 @@ class RayFunctionTask(AsyncFunctionTaskTemplate):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.plugin_config.existing_cluster is not None:
+            self._validate_existing_cluster()
         if self.reusable is not None and self.reusable.max_replicas != 1:
             # `replicas` is the number of shared clusters; only 1 is supported for now.
             raise flyte.errors.RuntimeUserError(
@@ -206,7 +217,34 @@ class RayFunctionTask(AsyncFunctionTaskTemplate):
                 "ReusePolicy(idle_ttl=...) to control when the shared RayCluster is shut down.",
             )
 
+    def _validate_existing_cluster(self):
+        cfg = self.plugin_config
+        conflicts = {
+            "worker_node_config": bool(cfg.worker_node_config),
+            "head_node_config": cfg.head_node_config is not None,
+            "shutdown_after_job_finishes": cfg.shutdown_after_job_finishes,
+            "ttl_seconds_after_finished": cfg.ttl_seconds_after_finished is not None,
+            "enable_autoscaling": cfg.enable_autoscaling,
+            "autoscaler_options": cfg.autoscaler_options is not None,
+            "address": cfg.address is not None,
+            "a reuse policy": self.reusable is not None,
+        }
+        for name, is_set in conflicts.items():
+            if is_set:
+                raise flyte.errors.RuntimeUserError(
+                    "BadConfiguration",
+                    f"existing_cluster cannot be combined with {name}: the task runs on a RayCluster "
+                    "it does not create or own.",
+                )
+
     async def pre(self, *args, **kwargs) -> Dict[str, Any]:
+        if self.plugin_config.existing_cluster is not None:
+            # The job driver runs on the shared head, which sets RAY_ADDRESS. Its working directory is
+            # the head's home, so packaging it as working_dir would upload the head's environment.
+            if not ray.is_initialized():
+                ray.init()
+            return {}
+
         init_params = {"address": self.plugin_config.address}
 
         if flyte.ctx().is_in_cluster():
@@ -220,11 +258,20 @@ class RayFunctionTask(AsyncFunctionTaskTemplate):
             ray.init(**init_params)
         return {}
 
+    def config(self, sctx: SerializationContext) -> Dict[str, str]:
+        cluster = self.plugin_config.existing_cluster
+        if cluster is None:
+            return super().config(sctx)
+        return {**super().config(sctx), _EXISTING_CLUSTER_KEY: cluster}
+
     def custom_config(self, sctx: SerializationContext) -> Optional[Dict[str, Any]]:
         cfg = self.plugin_config
         # Deprecated: runtime_env is removed KubeRay >= 1.1.0. It is replaced by runtime_env_yaml
         runtime_env = base64.b64encode(json.dumps(cfg.runtime_env).encode()).decode() if cfg.runtime_env else None
         runtime_env_yaml = yaml.dump(cfg.runtime_env) if cfg.runtime_env else None
+
+        if cfg.existing_cluster is not None:
+            return MessageToDict(RayJob(runtime_env=runtime_env, runtime_env_yaml=runtime_env_yaml))
 
         head_group_spec = None
         if cfg.head_node_config:
